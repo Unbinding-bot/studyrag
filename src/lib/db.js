@@ -19,7 +19,7 @@ export function openDB() {
       }
       if (!db.objectStoreNames.contains("chunks")) {
         const cs = db.createObjectStore("chunks", { keyPath: "id", autoIncrement: true });
-        cs.createIndex("docId", "docId", { unique: false });
+        cs.createIndex("docId",     "docId",     { unique: false });
         cs.createIndex("subjectId", "subjectId", { unique: false });
       }
       if (!db.objectStoreNames.contains("tests")) {
@@ -31,72 +31,66 @@ export function openDB() {
       }
     };
     req.onsuccess = (e) => { _db = e.target.result; resolve(_db); };
-    req.onerror = () => reject(req.error);
+    req.onerror   = () => reject(req.error);
   });
 }
+
+// ── generic helpers ───────────────────────────────────────────────────────────
 
 async function tx(store, mode, fn) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
-    const t = db.transaction(store, mode);
-    const s = t.objectStore(store);
+    const t   = db.transaction(store, mode);
+    const s   = t.objectStore(store);
     const req = fn(s);
     req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-
-async function txAll(store, mode, fn) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const t = db.transaction(store, mode);
-    const s = t.objectStore(store);
-    fn(s, resolve, reject);
+    req.onerror   = () => reject(req.error);
   });
 }
 
 // ── Subjects ──────────────────────────────────────────────────────────────────
+
 export const getSubjects = () => new Promise(async (res, rej) => {
-  const db = await openDB();
-  const t = db.transaction("subjects", "readonly");
+  const db  = await openDB();
+  const t   = db.transaction("subjects", "readonly");
   const req = t.objectStore("subjects").getAll();
   req.onsuccess = () => res(req.result);
-  req.onerror = () => rej(req.error);
+  req.onerror   = () => rej(req.error);
 });
 
-export const putSubject = (s) => tx("subjects", "readwrite", (store) => store.put(s));
+export const putSubject    = (s)  => tx("subjects", "readwrite", (store) => store.put(s));
 export const deleteSubject = (id) => tx("subjects", "readwrite", (store) => store.delete(id));
 
 // ── Documents ─────────────────────────────────────────────────────────────────
+
 export const getDocsBySubject = (subjectId) => new Promise(async (res, rej) => {
-  const db = await openDB();
-  const t = db.transaction("documents", "readonly");
-  const idx = t.objectStore("documents").index("subjectId");
-  const req = idx.getAll(subjectId);
+  const db  = await openDB();
+  const t   = db.transaction("documents", "readonly");
+  const req = t.objectStore("documents").index("subjectId").getAll(subjectId);
   req.onsuccess = () => res(req.result);
-  req.onerror = () => rej(req.error);
+  req.onerror   = () => rej(req.error);
 });
 
-export const getDoc = (id) => tx("documents", "readonly", (s) => s.get(id));
-export const putDoc = (d) => tx("documents", "readwrite", (s) => s.put(d));
+export const getDoc = (id) => tx("documents", "readonly",  (s) => s.get(id));
+export const putDoc = (d)  => tx("documents", "readwrite", (s) => s.put(d));
+
 export const deleteDoc = async (id) => {
   await tx("documents", "readwrite", (s) => s.delete(id));
-  // also purge chunks
+  // purge associated chunks
   const db = await openDB();
   await new Promise((res, rej) => {
-    const t = db.transaction("chunks", "readwrite");
-    const idx = t.objectStore("chunks").index("docId");
-    const req = idx.openCursor(id);
+    const t   = db.transaction("chunks", "readwrite");
+    const req = t.objectStore("chunks").index("docId").openCursor(id);
     req.onsuccess = (e) => {
       const cur = e.target.result;
-      if (cur) { cur.delete(); cur.continue(); }
-      else res();
+      if (cur) { cur.delete(); cur.continue(); } else res();
     };
     req.onerror = () => rej(req.error);
   });
 };
 
 // ── Chunks ────────────────────────────────────────────────────────────────────
+
 export const putChunks = async (chunks) => {
   const db = await openDB();
   return new Promise((res, rej) => {
@@ -104,33 +98,73 @@ export const putChunks = async (chunks) => {
     const s = t.objectStore("chunks");
     chunks.forEach((c) => s.put(c));
     t.oncomplete = res;
-    t.onerror = () => rej(t.error);
+    t.onerror    = () => rej(t.error);
   });
 };
 
 export const getChunksBySubject = (subjectId) => new Promise(async (res, rej) => {
-  const db = await openDB();
-  const t = db.transaction("chunks", "readonly");
-  const idx = t.objectStore("chunks").index("subjectId");
-  const req = idx.getAll(subjectId);
+  const db  = await openDB();
+  const t   = db.transaction("chunks", "readonly");
+  const req = t.objectStore("chunks").index("subjectId").getAll(subjectId);
   req.onsuccess = () => res(req.result);
-  req.onerror = () => rej(req.error);
+  req.onerror   = () => rej(req.error);
 });
+
+export const getChunksByDoc = (docId) => new Promise(async (res, rej) => {
+  const db  = await openDB();
+  const t   = db.transaction("chunks", "readonly");
+  const req = t.objectStore("chunks").index("docId").getAll(docId);
+  req.onsuccess = () => res(req.result);
+  req.onerror   = () => rej(req.error);
+});
+
+/** Returns chunks with embedding === null for a given subjectId */
+export const getUnembeddedChunks = async (subjectId) => {
+  const all = await getChunksBySubject(subjectId);
+  return all.filter(c => !c.embedding);
+};
+
+/** Update a single chunk (used by re-embed) */
+export const updateChunk = (chunk) => new Promise(async (res, rej) => {
+  const db  = await openDB();
+  const t   = db.transaction("chunks", "readwrite");
+  const req = t.objectStore("chunks").put(chunk);
+  req.onsuccess = () => res();
+  req.onerror   = () => rej(req.error);
+});
+
+/** Delete all chunks for a doc, then re-insert new ones */
+export const replaceChunksForDoc = async (docId, newChunks) => {
+  const db = await openDB();
+  // delete old
+  await new Promise((res, rej) => {
+    const t   = db.transaction("chunks", "readwrite");
+    const req = t.objectStore("chunks").index("docId").openCursor(docId);
+    req.onsuccess = (e) => {
+      const cur = e.target.result;
+      if (cur) { cur.delete(); cur.continue(); } else res();
+    };
+    req.onerror = () => rej(req.error);
+  });
+  // insert new
+  if (newChunks.length) await putChunks(newChunks);
+};
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
 export const getTestsBySubject = (subjectId) => new Promise(async (res, rej) => {
-  const db = await openDB();
-  const t = db.transaction("tests", "readonly");
-  const idx = t.objectStore("tests").index("subjectId");
-  const req = idx.getAll(subjectId);
+  const db  = await openDB();
+  const t   = db.transaction("tests", "readonly");
+  const req = t.objectStore("tests").index("subjectId").getAll(subjectId);
   req.onsuccess = () => res(req.result);
-  req.onerror = () => rej(req.error);
+  req.onerror   = () => rej(req.error);
 });
 
-export const putTest = (t) => tx("tests", "readwrite", (s) => s.put(t));
+export const putTest    = (t)  => tx("tests", "readwrite", (s) => s.put(t));
 export const deleteTest = (id) => tx("tests", "readwrite", (s) => s.delete(id));
 
 // ── Settings ──────────────────────────────────────────────────────────────────
+
 export const getSetting = async (key, fallback = null) => {
   try {
     const r = await tx("settings", "readonly", (s) => s.get(key));
@@ -142,8 +176,8 @@ export const putSetting = (key, value) =>
   tx("settings", "readwrite", (s) => s.put({ key, value }));
 
 export const getAllSettings = () => new Promise(async (res) => {
-  const db = await openDB();
-  const t = db.transaction("settings", "readonly");
+  const db  = await openDB();
+  const t   = db.transaction("settings", "readonly");
   const req = t.objectStore("settings").getAll();
   req.onsuccess = () => {
     const obj = {};

@@ -1,16 +1,16 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { getChunksBySubject } from "../lib/db.js";
 import { ragAnswer, embedQuery, topK } from "../lib/gemini.js";
-import { keywordSearch, LoadingSpinner } from "../App.jsx";
+import { keywordSearch, LoadingSpinner, toast } from "../App.jsx";
 
-// ── Markdown-ish renderer (bold, italic, inline code, newlines) ───────────────
+// ── Markdown renderer (bold, italic, inline code, newlines) ──────────────────
 function Render({ text }) {
   const html = text
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*(.+?)\*/g, "<em>$1</em>")
-    .replace(/`([^`]+)`/g, "<code style='background:var(--surface2);padding:1px 6px;border-radius:4px;font-size:12px;font-family:monospace'>$1</code>")
-    .replace(/\n/g, "<br/>");
+    .replace(/\*(.+?)\*/g,     "<em>$1</em>")
+    .replace(/`([^`]+)`/g,     "<code style='background:var(--surface2);padding:1px 6px;border-radius:4px;font-size:12px;font-family:monospace'>$1</code>")
+    .replace(/\n/g,            "<br/>");
   return <span dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
@@ -28,41 +28,39 @@ function Avatar({ role }) {
   );
 }
 
+// #24 fixed ellipsis — only append … when text is actually truncated
 function SourcePanel({ sources }) {
   const [open, setOpen] = useState(false);
   if (!sources?.length) return null;
   return (
     <div style={{ marginTop:6 }}>
-      <button
-        className="btn ghost"
-        style={{ fontSize:11, padding:"3px 9px", color:"var(--muted)" }}
-        onClick={() => setOpen(p => !p)}
-      >
+      <button className="btn ghost" style={{ fontSize:11, padding:"3px 9px", color:"var(--muted)" }}
+        onClick={() => setOpen(p => !p)}>
         📎 {open ? "Hide" : "Show"} sources ({sources.length})
       </button>
       {open && (
         <div style={{ marginTop:6, display:"flex", flexDirection:"column", gap:5 }}>
-          {sources.map((s, i) => (
-            <div
-              key={i}
-              style={{ padding:"8px 11px", background:"var(--surface2)", border:"1px solid var(--border)", borderRadius:8, fontSize:12 }}
-            >
-              <div style={{ fontWeight:600, color:"var(--accent)", marginBottom:3 }}>
-                {s.docName}{s.page ? ` · p.${s.page}` : ""}
-                {s.score != null && (
-                  <span style={{ marginLeft:8, fontSize:10, color:"var(--muted)", fontWeight:400 }}>
-                    {(s.score * 100).toFixed(0)}% match
-                  </span>
-                )}
+          {sources.map((s, i) => {
+            const snippet = s.text || "";
+            const truncated = snippet.length > 220;
+            return (
+              <div key={i} style={{ padding:"8px 11px", background:"var(--surface2)", border:"1px solid var(--border)", borderRadius:8, fontSize:12 }}>
+                <div style={{ fontWeight:600, color:"var(--accent)", marginBottom:3 }}>
+                  {s.docName}{s.page ? ` · p.${s.page}` : ""}
+                  {s.score != null && (
+                    <span style={{ marginLeft:8, fontSize:10, color:"var(--muted)", fontWeight:400 }}>
+                      {(s.score * 100).toFixed(0)}% match
+                    </span>
+                  )}
+                </div>
+                <div style={{ color:"var(--muted)", lineHeight:1.5,
+                  overflow:"hidden", display:"-webkit-box",
+                  WebkitLineClamp:2, WebkitBoxOrient:"vertical" }}>
+                  {truncated ? snippet.slice(0, 220) + "…" : snippet}
+                </div>
               </div>
-              <div style={{ color:"var(--muted)", lineHeight:1.5,
-                overflow:"hidden", display:"-webkit-box",
-                WebkitLineClamp:2, WebkitBoxOrient:"vertical",
-              }}>
-                {s.text?.slice(0, 220)}…
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>
@@ -79,8 +77,7 @@ function ChatBubble({ message: m }) {
           background: isUser ? "var(--accent)" : "var(--surface)",
           border:"1px solid var(--border)",
           borderRadius: isUser ? "14px 4px 14px 14px" : "4px 14px 14px 14px",
-          padding:"10px 14px",
-          fontSize:14, lineHeight:1.65,
+          padding:"10px 14px", fontSize:14, lineHeight:1.65,
           color: isUser ? "var(--accent-fg)" : "var(--text)",
         }}>
           <Render text={m.content} />
@@ -95,17 +92,29 @@ function ChatBubble({ message: m }) {
 }
 
 // ── Main Q&A Mode ─────────────────────────────────────────────────────────────
-export default function QAMode({ subject, settings }) {
-  const [messages, setMessages] = useState([{
+export default function QAMode({ subject, settings, chatHistory, onChatHistoryChange }) {
+  const initialMsg = {
     role:"assistant",
     content:`Ready. I'll answer questions about **${subject.name}** strictly from your uploaded documents. Ask anything.`,
-  }]);
+  };
+
+  const [messages, setMessages] = useState(chatHistory?.length ? chatHistory : [initialMsg]);
   const [input, setInput]         = useState("");
   const [loading, setLoading]     = useState(false);
   const [chunks, setChunks]       = useState([]);
   const [indexInfo, setIndexInfo] = useState("Loading index…");
+  // #22 undo clear
+  const [lastCleared, setLastCleared] = useState(null);
+  const [showUndo, setShowUndo]       = useState(false);
+  const undoTimerRef = useRef(null);
   const bottomRef = useRef();
   const inputRef  = useRef();
+
+  // sync messages up to parent for persistence (#15 handled in App)
+  const syncMessages = useCallback((msgs) => {
+    setMessages(msgs);
+    onChatHistoryChange?.(msgs);
+  }, [onChatHistoryChange]);
 
   useEffect(() => {
     getChunksBySubject(subject.id).then(c => {
@@ -115,21 +124,39 @@ export default function QAMode({ subject, settings }) {
     });
   }, [subject.id]);
 
-  const scrollToBottom = () => setTimeout(() => bottomRef.current?.scrollIntoView({ behavior:"smooth" }), 50);
+  const scrollToBottom = useCallback(() =>
+    setTimeout(() => bottomRef.current?.scrollIntoView({ behavior:"smooth" }), 50), []);
+
+  // #22 clear with undo
+  const clearChat = () => {
+    setLastCleared(messages);
+    syncMessages([{ role:"assistant", content:`Chat cleared. Ask anything about **${subject.name}**.` }]);
+    setShowUndo(true);
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+    undoTimerRef.current = setTimeout(() => { setShowUndo(false); setLastCleared(null); }, 5000);
+  };
+
+  const undoClear = () => {
+    if (lastCleared) { syncMessages(lastCleared); setLastCleared(null); }
+    setShowUndo(false);
+    if (undoTimerRef.current) clearTimeout(undoTimerRef.current);
+  };
+
+  useEffect(() => () => { if (undoTimerRef.current) clearTimeout(undoTimerRef.current); }, []);
 
   const send = useCallback(async () => {
     const q = input.trim();
     if (!q || loading) return;
     const hasKeys = (settings.apiKeys||[]).some(k=>k.key);
-    if (!hasKeys) { alert("Add at least one Gemini API key in Settings → General."); return; }
-    if (!chunks.length)   { alert("No document chunks found. Add documents to this subject first."); return; }
+    if (!hasKeys) { toast("Add a Gemini API key in Settings → General.", "error"); return; }
+    if (!chunks.length) { toast("No document chunks found. Add documents to this subject first.", "error"); return; }
 
     setInput("");
     setLoading(true);
-    setMessages(p => [...p, { role:"user", content:q }]);
+    const newMsgs = [...messages, { role:"user", content:q }];
+    syncMessages(newMsgs);
     scrollToBottom();
 
-    // Retrieve relevant chunks
     let relevant = [];
     try {
       const qVec = await embedQuery(q, settings);
@@ -142,35 +169,45 @@ export default function QAMode({ subject, settings }) {
     }
 
     if (!relevant.length) {
-      setMessages(p => [...p, { role:"assistant", content:"I couldn't find relevant content in your documents for that question. Try rephrasing, or check that documents have been added to this subject." }]);
+      syncMessages([...newMsgs, { role:"assistant", content:"I couldn't find relevant content in your documents for that question. Try rephrasing, or check that documents have been added to this subject." }]);
       setLoading(false);
       return;
     }
 
-    // Streaming response
     const msgId = crypto.randomUUID();
-    setMessages(p => [...p, { role:"assistant", content:"", id:msgId, streaming:true, sources:relevant }]);
+    syncMessages([...newMsgs, { role:"assistant", content:"", id:msgId, streaming:true, sources:relevant }]);
 
     try {
       await ragAnswer({
-        question: q,
-        chunks: relevant,
-        settings: settings,
+        question: q, chunks: relevant, settings,
         model: settings.model || "gemini-2.5-flash-lite",
         onChunk: (_, full) => {
-          setMessages(p => p.map(m => m.id === msgId ? { ...m, content:full } : m));
+          setMessages(p => {
+            const updated = p.map(m => m.id === msgId ? { ...m, content:full } : m);
+            onChatHistoryChange?.(updated);
+            return updated;
+          });
           scrollToBottom();
         },
       });
-      setMessages(p => p.map(m => m.id === msgId ? { ...m, streaming:false } : m));
+      setMessages(p => {
+        const updated = p.map(m => m.id === msgId ? { ...m, streaming:false } : m);
+        onChatHistoryChange?.(updated);
+        return updated;
+      });
     } catch (e) {
-      setMessages(p => p.map(m => m.id === msgId ? { ...m, content:`Error: ${e.message}`, streaming:false } : m));
+      setMessages(p => {
+        const updated = p.map(m => m.id === msgId ? { ...m, content:`Error: ${e.message}`, streaming:false } : m);
+        onChatHistoryChange?.(updated);
+        return updated;
+      });
+      toast(e.message, "error");
     } finally {
       setLoading(false);
       scrollToBottom();
       inputRef.current?.focus();
     }
-  }, [input, loading, chunks, settings]);
+  }, [input, loading, chunks, settings, messages, syncMessages, scrollToBottom, onChatHistoryChange]);
 
   return (
     <div style={{ display:"flex", flexDirection:"column", height:"calc(100vh - 52px)" }}>
@@ -182,13 +219,18 @@ export default function QAMode({ subject, settings }) {
             {indexInfo}{!(settings.apiKeys||[]).some(k=>k.key) && " · ⚠ no API key"}
           </span>
         </div>
-        <button
-          className="btn ghost"
-          style={{ fontSize:12, padding:"5px 10px" }}
-          onClick={() => setMessages([{ role:"assistant", content:`Chat cleared. Ask anything about **${subject.name}**.` }])}
-        >
-          Clear chat
-        </button>
+        <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+          {/* #22 undo toast inline */}
+          {showUndo && (
+            <div className="fade-in" style={{ display:"flex", alignItems:"center", gap:8, fontSize:12, color:"var(--muted)" }}>
+              Chat cleared
+              <button className="btn sm" style={{ padding:"3px 9px", fontSize:11 }} onClick={undoClear}>Undo</button>
+            </div>
+          )}
+          <button className="btn ghost" style={{ fontSize:12, padding:"5px 10px" }} onClick={clearChat}>
+            Clear chat
+          </button>
+        </div>
       </div>
 
       {/* Messages */}
@@ -208,12 +250,9 @@ export default function QAMode({ subject, settings }) {
       {/* Input */}
       <div style={{ padding:"13px 24px 16px", borderTop:"1px solid var(--border)", flexShrink:0 }}>
         <div style={{ display:"flex", gap:8 }}>
-          <textarea
-            ref={inputRef}
-            className="input"
-            value={input}
+          <textarea ref={inputRef} className="input" value={input}
             onChange={e => setInput(e.target.value)}
-            onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
+            onKeyDown={e => { if (e.key==="Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
             placeholder="Ask a question about your documents… (Enter to send, Shift+Enter for newline)"
             style={{ resize:"none", height:46, paddingTop:11, lineHeight:1.5 }}
           />
